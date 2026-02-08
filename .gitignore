@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+captured_body.json
+test_*.py
+capture_*.py
+*.log
+.venv/
+venv/
