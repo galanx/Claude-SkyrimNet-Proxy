@@ -1,6 +1,6 @@
 # Claude SkyrimNet Proxy
 
-An OpenAI-compatible API proxy that routes requests through a Claude Max subscription via the Claude CLI. Designed for use with [SkyrimNet](https://www.nexusmods.com/skyrimspecialedition/mods/137625) to power AI-driven NPC conversations in Skyrim.
+An OpenAI-compatible API proxy that routes requests through a Claude Max subscription via the Claude CLI. Designed for use with [SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin) to power AI-driven NPC conversations in Skyrim.
 
 ## How It Works
 
