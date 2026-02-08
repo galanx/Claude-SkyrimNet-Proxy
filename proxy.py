@@ -153,18 +153,26 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
     if system_prompt:
         body["system"].append({"type": "text", "text": system_prompt})
 
-    # 2. Replace last user text block (preserve system-reminder blocks)
-    user_text = messages[-1]["content"] if messages else ""
-    msgs = body["messages"]
-    for i in range(len(msgs) - 1, -1, -1):
-        if msgs[i].get("role") == "user":
-            content = msgs[i].get("content", [])
-            if isinstance(content, list):
-                for j in range(len(content) - 1, -1, -1):
-                    if isinstance(content[j], dict) and content[j].get("type") == "text":
-                        content[j]["text"] = user_text
-                        break
-            break
+    # 2. Build full conversation, preserving template auth blocks in first user msg
+    # The template's first user message contains system-reminder content blocks
+    # that authenticate this as a Claude Code request — we must keep them.
+    auth_blocks = []
+    template_first = body["messages"][0] if body["messages"] else {}
+    if isinstance(template_first.get("content"), list):
+        for block in template_first["content"]:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if "<system-reminder>" in block.get("text", ""):
+                    auth_blocks.append(block)
+
+    new_messages = []
+    for i, m in enumerate(messages):
+        if i == 0 and m["role"] == "user":
+            # First user message: prepend auth blocks from template
+            content = auth_blocks + [{"type": "text", "text": m["content"]}]
+            new_messages.append({"role": "user", "content": content})
+        else:
+            new_messages.append({"role": m["role"], "content": [{"type": "text", "text": m["content"]}]})
+    body["messages"] = new_messages
 
     # 3. Model, streaming, and disable extended thinking
     body["model"] = model
@@ -182,7 +190,7 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
     headers["Content-Length"] = str(len(body_bytes))
 
     request_id = uuid.uuid4().hex[:8]
-    logger.info(f"[{request_id}] -> {model}")
+    logger.info(f"[{request_id}] -> {model} ({len(messages)} msgs)")
     start = time.time()
 
     session = auth.session or aiohttp.ClientSession()
@@ -249,7 +257,7 @@ async def call_api_streaming(system_prompt: Optional[str], messages: list, model
     request_id = uuid.uuid4().hex[:8]
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
     created = int(time.time())
-    logger.info(f"[{request_id}] -> {model} (stream)")
+    logger.info(f"[{request_id}] -> {model} ({len(messages)} msgs, stream)")
     start = time.time()
     total_chars = 0
 
