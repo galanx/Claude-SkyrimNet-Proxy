@@ -430,6 +430,7 @@ async def list_models():
         "data": [
             {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
+            {"id": "claude-3-7-sonnet-20250219", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
         ],
     }
@@ -453,6 +454,7 @@ async def dashboard():
     models = [
         ("claude-opus-4-6", "Opus 4.6", "Most capable, slowest"),
         ("claude-sonnet-4-5-20250929", "Sonnet 4.5", "Best balance (default)"),
+        ("claude-3-7-sonnet-20250219", "Sonnet 3.7", "Previous gen, good balance"),
         ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest, least capable"),
     ]
     model_rows = "".join(
