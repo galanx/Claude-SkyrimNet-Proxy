@@ -67,7 +67,7 @@ Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a qui
 In your SkyrimNet configuration, set:
 - **API Endpoint**: `http://localhost:8000/v1/chat/completions`
 - **API Key**: (leave empty or set any value — not required)
-- **Model**: `claude-sonnet-4-5-20250929` (recommended), `claude-3-7-sonnet-20250219`, or `claude-opus-4-6`
+- **Model**: `claude-sonnet-4-5-20250929` (recommended) or `claude-opus-4-6`
 
 ### Supported Models
 
@@ -75,7 +75,6 @@ In your SkyrimNet configuration, set:
 |----------|------|-------|
 | `claude-opus-4-6` | Opus 4.6 | Most capable, highest latency |
 | `claude-sonnet-4-5-20250929` | Sonnet 4.5 | Best balance (default) |
-| `claude-3-7-sonnet-20250219` | Sonnet 3.7 | Previous gen, good balance |
 | `claude-haiku-4-5-20251001` | Haiku 4.5 | Fastest, least capable |
 
 ## Important Legal Disclaimer
