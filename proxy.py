@@ -57,6 +57,28 @@ class AuthCache:
 
 auth = AuthCache()
 
+# --- OpenRouter + Round-Robin state ---
+openrouter_api_key: Optional[str] = None
+_round_robin_counter: int = 0
+
+
+def parse_model_list(model_field: str) -> list[str]:
+    """Parse comma-separated model list from request, trimming whitespace."""
+    return [m.strip() for m in model_field.split(",") if m.strip()]
+
+
+def pick_model_round_robin(models: list[str]) -> str:
+    """Pick next model from list using round-robin."""
+    global _round_robin_counter
+    model = models[_round_robin_counter % len(models)]
+    _round_robin_counter += 1
+    return model
+
+
+def is_openrouter_model(model: str) -> bool:
+    """OpenRouter models use 'provider/model' format (contain '/')."""
+    return "/" in model
+
 
 # --- MITM Interceptor (startup only) ---
 
@@ -329,6 +351,104 @@ async def call_api_streaming(system_prompt: Optional[str], messages: list, model
             await session.close()
 
 
+# --- OpenRouter API calls ---
+
+async def call_openrouter_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int) -> str:
+    """Forward request to OpenRouter (OpenAI-compatible), collect full response."""
+    if not openrouter_api_key:
+        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
+
+    oai_messages = []
+    if system_prompt:
+        oai_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        oai_messages.append({"role": m["role"], "content": m["content"]})
+
+    payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
+    headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
+
+    request_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{request_id}] -> OpenRouter {model} ({len(messages)} msgs)")
+    start = time.time()
+
+    session = auth.session or aiohttp.ClientSession()
+    try:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload, headers=headers,
+        ) as resp:
+            elapsed = time.time() - start
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
+                raise HTTPException(status_code=resp.status, detail=error_body[:200])
+            data = await resp.json()
+            text = data["choices"][0]["message"]["content"]
+            logger.info(f"[{request_id}] <- {len(text)} chars ({elapsed:.1f}s, OpenRouter)")
+            return text
+    finally:
+        if not auth.session:
+            await session.close()
+
+
+async def call_openrouter_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int):
+    """Forward request to OpenRouter with streaming, passthrough SSE directly."""
+    if not openrouter_api_key:
+        yield 'data: {"error": "OpenRouter API key not configured"}\n\n'
+        yield "data: [DONE]\n\n"
+        return
+
+    oai_messages = []
+    if system_prompt:
+        oai_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        oai_messages.append({"role": m["role"], "content": m["content"]})
+
+    payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens, "stream": True}
+    headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
+
+    request_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{request_id}] -> OpenRouter {model} ({len(messages)} msgs, stream)")
+    start = time.time()
+
+    session = auth.session or aiohttp.ClientSession()
+    owns_session = not auth.session
+    try:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload, headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
+                cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+                err_chunk = {"id": cmpl_id, "object": "chat.completion.chunk",
+                             "created": int(time.time()), "model": model,
+                             "choices": [{"index": 0, "delta": {"content": f"[OpenRouter Error {resp.status}]"}, "finish_reason": None}]}
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            # OpenRouter returns OpenAI-format SSE — passthrough directly
+            buffer = ""
+            async for raw_chunk in resp.content.iter_any():
+                buffer += raw_chunk.decode("utf-8", errors="replace")
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+                    event = event.strip()
+                    if event:
+                        yield event + "\n\n"
+
+            if buffer.strip():
+                yield buffer.strip() + "\n\n"
+
+            elapsed = time.time() - start
+            logger.info(f"[{request_id}] <- stream done ({elapsed:.1f}s, OpenRouter)")
+    finally:
+        if owns_session:
+            await session.close()
+
+
 # --- OpenAI-compatible API ---
 
 class ChatMessage(BaseModel):
@@ -357,10 +477,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
-    if not auth.is_ready:
-        raise HTTPException(status_code=503, detail="Auth not ready -- warming up")
+    # Parse model list and pick via round-robin
+    model_field = req.model or DEFAULT_MODEL
+    models = parse_model_list(model_field)
+    model = pick_model_round_robin(models) if len(models) > 1 else models[0]
+    use_openrouter = is_openrouter_model(model)
 
-    model = req.model or DEFAULT_MODEL
+    if not use_openrouter and not auth.is_ready:
+        raise HTTPException(status_code=503, detail="Auth not ready -- warming up")
 
     system_prompt = None
     anthropic_messages = []
@@ -386,16 +510,23 @@ async def chat_completions(req: ChatRequest):
 
     max_tokens = req.max_tokens or 4096
 
-    # Streaming response (SSE)
-    if req.stream:
-        return StreamingResponse(
-            call_api_streaming(system_prompt, merged, model, max_tokens),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    # Non-streaming response (JSON)
-    response = await call_api_direct(system_prompt, merged, model, max_tokens)
+    # Route to correct provider
+    if use_openrouter:
+        if req.stream:
+            return StreamingResponse(
+                call_openrouter_streaming(system_prompt, merged, model, max_tokens),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        response = await call_openrouter_direct(system_prompt, merged, model, max_tokens)
+    else:
+        if req.stream:
+            return StreamingResponse(
+                call_api_streaming(system_prompt, merged, model, max_tokens),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        response = await call_api_direct(system_prompt, merged, model, max_tokens)
 
     if not response:
         raise HTTPException(status_code=500, detail="Empty response")
@@ -423,17 +554,29 @@ async def chat_completions(req: ChatRequest):
     }
 
 
+@app.post("/config/openrouter-key")
+async def set_openrouter_key(request: Request):
+    global openrouter_api_key
+    data = await request.json()
+    key = data.get("key", "").strip()
+    if not key:
+        openrouter_api_key = None
+        return {"status": "cleared"}
+    openrouter_api_key = key
+    logger.info("OpenRouter API key configured")
+    return {"status": "saved"}
+
+
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-3-7-sonnet-20250219", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
-        ],
-    }
+    data = [
+        {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
+        {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
+        {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
+    ]
+    if openrouter_api_key:
+        data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
+    return {"object": "list", "data": data}
 
 
 @app.get("/health")
@@ -442,6 +585,7 @@ async def health():
         "status": "healthy" if auth.is_ready else "warming_up",
         "claude_path": CLAUDE_PATH,
         "auth_cached": auth.is_ready,
+        "openrouter_configured": openrouter_api_key is not None,
     }
 
 
@@ -451,10 +595,14 @@ async def dashboard():
     status_color = "#4ade80" if auth.is_ready else "#facc15"
     template_size = len(json.dumps(auth.body_template)) if auth.body_template else 0
 
+    or_status = "Configured" if openrouter_api_key else "Not set"
+    or_color = "#4ade80" if openrouter_api_key else "#64748b"
+
     models = [
         ("claude-opus-4-6", "Opus 4.6", "Most capable, slowest"),
         ("claude-sonnet-4-5-20250929", "Sonnet 4.5", "Best balance (default)"),
         ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest, least capable"),
+        ("provider/model", "OpenRouter", "Any model via OpenRouter (requires key)"),
     ]
     model_rows = "".join(
         f'<tr><td style="font-family:monospace;color:#93c5fd">{mid}</td><td>{name}</td><td style="color:#9ca3af">{desc}</td></tr>'
@@ -508,6 +656,21 @@ async def dashboard():
   </div>
 
   <div class="card">
+    <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">OpenRouter API Key</h3>
+    <div style="display:flex; gap:8px; align-items:center">
+      <input type="password" id="orKey" placeholder="Paste your API key here (sk-or-...)"
+             style="flex:1; background:#0f172a; color:#e2e8f0; border:1px solid #334155;
+                    border-radius:6px; padding:8px 12px; font-family:monospace; font-size:0.85rem">
+      <button onclick="saveOrKey()" style="margin-top:0">Save</button>
+      <span id="orStatus" style="color:{or_color}; font-size:0.85rem; font-weight:600">{or_status}</span>
+    </div>
+    <div style="color:#64748b; font-size:0.8rem; margin-top:8px">
+      Use <code style="color:#67e8f9">provider/model</code> IDs (e.g. <code style="color:#67e8f9">openai/gpt-4o</code>) to route through OpenRouter.
+      Comma-separate models for round-robin rotation.
+    </div>
+  </div>
+
+  <div class="card">
     <h3 style="margin:0 0 8px; font-size:1rem; color:#f1f5f9">Quick Test</h3>
     <textarea id="sysPrompt" rows="2" placeholder="System prompt (e.g. You are Lydia, a Nord housecarl.)">You are Lydia, a Nord housecarl sworn to protect the Dragonborn. Stay in character. One sentence only.</textarea>
     <textarea id="userMsg" rows="1" placeholder="User message" style="margin-top:6px">What do you think of dragons?</textarea>
@@ -517,6 +680,23 @@ async def dashboard():
   </div>
 
 <script>
+async function saveOrKey() {{
+  const key = document.getElementById('orKey').value.trim();
+  const status = document.getElementById('orStatus');
+  try {{
+    await fetch('/config/openrouter-key', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{key: key}})
+    }});
+    status.textContent = key ? 'Configured' : 'Not set';
+    status.style.color = key ? '#4ade80' : '#64748b';
+    document.getElementById('orKey').value = '';
+  }} catch(e) {{
+    status.textContent = 'Error';
+    status.style.color = '#f87171';
+  }}
+}}
+
 async function testChat() {{
   const btn = document.getElementById('testBtn');
   const resp = document.getElementById('response');

@@ -6,6 +6,7 @@ An OpenAI-compatible API proxy that routes requests through a Claude Max subscri
 
 ```
 SkyrimNet (game) --> POST /v1/chat/completions --> Proxy (port 8000) --> Anthropic API
+                                                                    \-> OpenRouter API
 ```
 
 1. **Startup**: The proxy spawns a single `claude --print` command to capture authenticated headers and a minimal request template from the Claude CLI.
@@ -59,6 +60,7 @@ Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a qui
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | OpenAI-compatible chat completions (streaming + non-streaming) |
 | `/v1/models` | GET | List available models |
+| `/config/openrouter-key` | POST | Set OpenRouter API key (JSON body: `{"key": "sk-or-..."}`) |
 | `/health` | GET | Health check |
 | `/` | GET | Web dashboard |
 
@@ -67,7 +69,7 @@ Open `http://127.0.0.1:8000` in a browser to see the status dashboard with a qui
 In your SkyrimNet configuration, set:
 - **API Endpoint**: `http://localhost:8000/v1/chat/completions`
 - **API Key**: (leave empty or set any value — not required)
-- **Model**: `claude-sonnet-4-5-20250929` (recommended) or `claude-opus-4-6`
+- **Model**: `claude-sonnet-4-5-20250929` (recommended), `claude-opus-4-6`, or any OpenRouter model
 
 ### Supported Models
 
@@ -76,6 +78,25 @@ In your SkyrimNet configuration, set:
 | `claude-opus-4-6` | Opus 4.6 | Most capable, highest latency |
 | `claude-sonnet-4-5-20250929` | Sonnet 4.5 | Best balance (default) |
 | `claude-haiku-4-5-20251001` | Haiku 4.5 | Fastest, least capable |
+| `provider/model` | OpenRouter | Any model via [OpenRouter](https://openrouter.ai) (requires API key) |
+
+### OpenRouter Support
+
+You can use any model available on [OpenRouter](https://openrouter.ai) by setting an API key:
+
+1. Get an API key from [openrouter.ai/keys](https://openrouter.ai/keys)
+2. Open the dashboard at `http://127.0.0.1:8000` and paste the key in the OpenRouter section
+3. Use `provider/model` format in the Model field (e.g. `openai/gpt-4o`, `google/gemini-2.0-flash-001`)
+
+### Model Rotation
+
+You can comma-separate multiple models to rotate between them round-robin:
+
+```
+claude-sonnet-4-5-20250929, openai/gpt-4o
+```
+
+Each request cycles to the next model in the list. Models containing `/` route through OpenRouter; all others route through Anthropic.
 
 ## Important Legal Disclaimer
 
@@ -105,6 +126,22 @@ In your SkyrimNet configuration, set:
 
 ### "credential only authorized for Claude Code" error
 - The cached auth has expired. Restart the proxy to re-capture.
+
+## Changelog
+
+### 2025-02-17
+- Added OpenRouter support — use any `provider/model` from [OpenRouter](https://openrouter.ai) (e.g. `openai/gpt-4o`, `google/gemini-2.0-flash-001`)
+- Added round-robin model rotation — comma-separate models to cycle between them per request
+- Added dashboard UI for configuring OpenRouter API key
+- Added `POST /config/openrouter-key` endpoint
+- Removed Sonnet 3.7 — not available via Claude Code auth
+
+### Initial Release
+- OpenAI-compatible proxy with Claude Max subscription auth
+- Direct API calls with persistent session (no subprocess per request)
+- Streaming + non-streaming support
+- Web dashboard with quick test form
+- Models: Opus 4.6, Sonnet 4.5 (default), Haiku 4.5
 
 ## License
 
