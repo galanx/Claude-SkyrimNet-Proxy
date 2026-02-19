@@ -110,6 +110,7 @@ async def interceptor_handler(request):
         # Strip tool definitions (60KB dead weight) and extended thinking
         parsed.pop("tools", None)
         parsed.pop("thinking", None)
+        parsed.pop("context_management", None)
         auth.body_template = parsed
         template_size = len(json.dumps(parsed))
         logger.info(f"Captured {len(auth.headers)} headers + template ({template_size:,} bytes, tools stripped)")
