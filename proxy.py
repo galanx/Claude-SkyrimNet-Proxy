@@ -42,6 +42,23 @@ if not CLAUDE_PATH:
     raise RuntimeError("claude CLI not found on PATH")
 logger.info(f"Using Claude CLI: {CLAUDE_PATH}")
 
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _load_config() -> dict:
+    """Load persisted config from disk, return empty dict on missing/corrupt file."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config(data: dict) -> None:
+    """Persist config dict to disk."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
 
 # --- Auth cache + persistent session ---
 
@@ -58,7 +75,10 @@ class AuthCache:
 auth = AuthCache()
 
 # --- OpenRouter + Round-Robin state ---
-openrouter_api_key: Optional[str] = None
+_cfg = _load_config()
+openrouter_api_key: Optional[str] = _cfg.get("openrouter_api_key") or None
+if openrouter_api_key:
+    logger.info("OpenRouter API key loaded from config.json")
 _round_robin_counter: int = 0
 
 
@@ -354,7 +374,7 @@ async def call_api_streaming(system_prompt: Optional[str], messages: list, model
 
 # --- OpenRouter API calls ---
 
-async def call_openrouter_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int) -> str:
+async def call_openrouter_direct(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params) -> str:
     """Forward request to OpenRouter (OpenAI-compatible), collect full response."""
     if not openrouter_api_key:
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
@@ -366,6 +386,7 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
         oai_messages.append({"role": m["role"], "content": m["content"]})
 
     payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
+    payload.update({k: v for k, v in extra_params.items() if v is not None})
     headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -392,7 +413,7 @@ async def call_openrouter_direct(system_prompt: Optional[str], messages: list, m
             await session.close()
 
 
-async def call_openrouter_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int):
+async def call_openrouter_streaming(system_prompt: Optional[str], messages: list, model: str, max_tokens: int, **extra_params):
     """Forward request to OpenRouter with streaming, passthrough SSE directly."""
     if not openrouter_api_key:
         yield 'data: {"error": "OpenRouter API key not configured"}\n\n'
@@ -406,6 +427,7 @@ async def call_openrouter_streaming(system_prompt: Optional[str], messages: list
         oai_messages.append({"role": m["role"], "content": m["content"]})
 
     payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens, "stream": True}
+    payload.update({k: v for k, v in extra_params.items() if v is not None})
     headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -463,6 +485,9 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     stream: Optional[bool] = False
 
+    class Config:
+        extra = "allow"
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -511,15 +536,17 @@ async def chat_completions(req: ChatRequest):
 
     max_tokens = req.max_tokens or 4096
 
+    extra_params = {k: v for k, v in (req.model_extra or {}).items() if v is not None}
+
     # Route to correct provider
     if use_openrouter:
         if req.stream:
             return StreamingResponse(
-                call_openrouter_streaming(system_prompt, merged, model, max_tokens),
+                call_openrouter_streaming(system_prompt, merged, model, max_tokens, **extra_params),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        response = await call_openrouter_direct(system_prompt, merged, model, max_tokens)
+        response = await call_openrouter_direct(system_prompt, merged, model, max_tokens, **extra_params)
     else:
         if req.stream:
             return StreamingResponse(
@@ -560,11 +587,17 @@ async def set_openrouter_key(request: Request):
     global openrouter_api_key
     data = await request.json()
     key = data.get("key", "").strip()
+    cfg = _load_config()
     if not key:
         openrouter_api_key = None
+        cfg.pop("openrouter_api_key", None)
+        _save_config(cfg)
+        logger.info("OpenRouter API key cleared")
         return {"status": "cleared"}
     openrouter_api_key = key
-    logger.info("OpenRouter API key configured")
+    cfg["openrouter_api_key"] = key
+    _save_config(cfg)
+    logger.info("OpenRouter API key configured and saved to config.json")
     return {"status": "saved"}
 
 
@@ -596,7 +629,7 @@ async def dashboard():
     status_color = "#4ade80" if auth.is_ready else "#facc15"
     template_size = len(json.dumps(auth.body_template)) if auth.body_template else 0
 
-    or_status = "Configured" if openrouter_api_key else "Not set"
+    or_status = "Configured (saved)" if openrouter_api_key else "Not set"
     or_color = "#4ade80" if openrouter_api_key else "#64748b"
 
     models = [
@@ -689,7 +722,7 @@ async function saveOrKey() {{
       method: 'POST', headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{key: key}})
     }});
-    status.textContent = key ? 'Configured' : 'Not set';
+    status.textContent = key ? 'Configured (saved)' : 'Not set';
     status.style.color = key ? '#4ade80' : '#64748b';
     document.getElementById('orKey').value = '';
   }} catch(e) {{
