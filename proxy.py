@@ -322,8 +322,11 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
 
             resp_body = await resp.read()
             text_parts = []
+            _usage = None
             content_type = resp.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
+                _in_tok = 0
+                _out_tok = 0
                 for line in resp_body.decode("utf-8", errors="replace").split("\n"):
                     if line.startswith("data: "):
                         data_str = line[6:].strip()
@@ -331,23 +334,31 @@ async def call_api_direct(system_prompt: Optional[str], messages: list, model: s
                             continue
                         try:
                             event = json.loads(data_str)
-                            if event.get("type") == "content_block_delta":
+                            if event.get("type") == "message_start":
+                                _in_tok = event.get("message", {}).get("usage", {}).get("input_tokens", 0)
+                            elif event.get("type") == "message_delta":
+                                _out_tok = event.get("usage", {}).get("output_tokens", 0)
+                            elif event.get("type") == "content_block_delta":
                                 delta = event.get("delta", {})
                                 if delta.get("type") == "text_delta":
                                     text_parts.append(delta.get("text", ""))
                         except json.JSONDecodeError:
                             pass
+                if _in_tok or _out_tok:
+                    _usage = {"input_tokens": _in_tok, "output_tokens": _out_tok}
             else:
                 try:
                     data = json.loads(resp_body)
                     for block in data.get("content", []):
                         if block.get("type") == "text":
                             text_parts.append(block.get("text", ""))
+                    _usage = data.get("usage", {})
                 except json.JSONDecodeError:
-                    pass
+                    _usage = {}
 
             response_text = "".join(text_parts)
-            logger.info(f"[{request_id}] <- {len(response_text)} chars ({elapsed:.1f}s)")
+            _tok = f" | in={_usage.get('input_tokens', 0)} out={_usage.get('output_tokens', 0)} tok" if _usage else ""
+            logger.info(f"[{request_id}] <- {len(response_text)} chars ({elapsed:.1f}s){_tok}")
             return response_text
     finally:
         if owns_session:
