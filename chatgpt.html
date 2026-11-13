@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ChatGPT · SkyrimNet Proxy</title>
+  <style>
+    body { font: 16px system-ui; max-width: 760px; margin: 40px auto; padding: 20px; background: #0f172a; color: #e2e8f0; }
+    button, select, input, textarea { font: inherit; margin: 6px; padding: 8px; }
+    a { color: #93c5fd; }
+    pre { white-space: pre-wrap; }
+    textarea { width: 90%; min-height: 80px; }
+  </style>
+</head>
+<body>
+  <h1>ChatGPT for SkyrimNet</h1>
+  <p id="status">Checking connection…</p>
+  <p>Eligible NPC requests use your ChatGPT plan.
+    <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage</a>
+  </p>
+  <select id="accounts" aria-label="ChatGPT account"><option value="">Add another account</option></select>
+  <button id="connect">Continue with ChatGPT</button>
+  <button id="use">Use selected account</button>
+  <button id="pause">Pause ChatGPT</button>
+  <h2>Model</h2>
+  <p>Reasoning is off. Choose a model supporting reasoning “none”, such as GPT-6.1 Terra.</p>
+  <select id="models" aria-label="ChatGPT model"></select>
+  <button id="refresh">Refresh models</button>
+  <button id="copy">Copy model ID</button>
+  <p>Use the copied <code>chatgpt/MODEL</code> ID in SkyrimNet.
+    Its endpoint is this proxy’s address plus <code>/v1/chat/completions</code>.
+  </p>
+  <h2>Dialogue test</h2>
+  <textarea id="prompt" aria-label="Character prompt">You are a tired Whiterun innkeeper. Stay in character. Reply with one short spoken sentence, without narration or markdown.</textarea>
+  <input id="line" aria-label="Player dialogue" value="Any rumors around town?" size="40">
+  <button id="test">Test streaming reply</button>
+  <p id="timing"></p>
+  <pre id="reply"></pre>
+  <pre id="error" role="alert"></pre>
+  <p><a href="/">Claude and OpenRouter settings</a></p>
+<script>
+const element = id => document.getElementById(id);
+
+async function api(url, body) {
+  const options = body === undefined ? {} : {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Proxy-Setup': '1'},
+    body: JSON.stringify(body)
+  };
+  const response = await fetch(url, options);
+  const data = await response.json();
+  if (!response.ok) throw Error(data.detail || 'Request failed');
+  return data;
+}
+
+function showError(error) {
+  element('error').textContent = error.message;
+}
+
+async function refreshModels() {
+  element('models').replaceChildren();
+  const data = await api('/chatgpt/models');
+  for (const model of data.data) {
+    element('models').add(new Option(model.name + ' — ' + model.id, model.id));
+  }
+  const preferred = [...element('models').options].find(
+    option => option.value === 'chatgpt/gpt-6.1-terra'
+  );
+  if (preferred) preferred.selected = true;
+}
+
+async function refreshStatus() {
+  const data = await api('/chatgpt/status');
+  element('accounts').replaceChildren(new Option('Add another account', ''));
+  for (const account of data.accounts) {
+    element('accounts').add(new Option(account.label + ' · ' + account.id, account.id));
+  }
+  element('accounts').value = data.active || '';
+  const active = data.accounts.find(account => account.id === data.active);
+  element('status').textContent = active
+    ? (active.plan_enabled ? 'Using ChatGPT plan · ' : 'Plan usage disabled · ') + active.label
+    : 'ChatGPT is not active';
+  if (active?.plan_enabled) await refreshModels();
+}
+
+element('connect').onclick = async () => {
+  try {
+    const data = await api('/chatgpt/sign-in', {
+      account_id: element('accounts').value || null
+    });
+    location.assign(data.url);
+  } catch (error) {
+    showError(error);
+  }
+};
+
+element('use').onclick = async () => {
+  try {
+    if (!element('accounts').value) throw Error('Select a saved account');
+    await api('/chatgpt/select', {account_id: element('accounts').value});
+    await refreshStatus();
+  } catch (error) {
+    showError(error);
+  }
+};
+
+element('pause').onclick = async () => {
+  try {
+    await api('/chatgpt/select', {account_id: null});
+    await refreshStatus();
+  } catch (error) {
+    showError(error);
+  }
+};
+
+element('refresh').onclick = () => refreshModels().catch(showError);
+element('copy').onclick = () => navigator.clipboard.writeText(
+  element('models').value
+).catch(showError);
+
+async function readReply(response, start) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let first = null;
+  let completed = false;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      buffer += decoder.decode(part.value, {stream: true});
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (!frame.startsWith('data: ')) continue;
+        const raw = frame.slice(6);
+        if (raw === '[DONE]') {
+          completed = true;
+          continue;
+        }
+        const data = JSON.parse(raw);
+        if (data.error) throw Error(data.error.message);
+        const text = data.choices?.[0]?.delta?.content || '';
+        if (text && first === null) {
+          first = performance.now();
+          element('timing').textContent = 'First text in ' + ((first - start) / 1000).toFixed(2) + ' s';
+        }
+        element('reply').textContent += text;
+      }
+    }
+    if (!completed) throw Error('Reply interrupted before completion');
+    element('timing').textContent += ' · Complete in ' + ((performance.now() - start) / 1000).toFixed(2) + ' s';
+  } finally {
+    await reader.cancel();
+  }
+}
+
+element('test').onclick = async () => {
+  const start = performance.now();
+  element('reply').textContent = '';
+  element('error').textContent = '';
+  element('timing').textContent = '';
+  element('test').disabled = true;
+  try {
+    if (!element('models').value) throw Error('Connect ChatGPT and select a model first');
+    const response = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: element('models').value,
+        stream: true,
+        messages: [
+          {role: 'system', content: element('prompt').value},
+          {role: 'user', content: element('line').value}
+        ]
+      })
+    });
+    if (!response.ok) {
+      const data = await response.json();
+      throw Error(data.detail || 'Request failed');
+    }
+    await readReply(response, start);
+  } catch (error) {
+    showError(error);
+  } finally {
+    element('test').disabled = false;
+  }
+};
+
+refreshStatus().catch(showError);
+</script>
+</body>
+</html>

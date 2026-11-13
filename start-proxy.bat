@@ -1,5 +1,9 @@
 @echo off
 title Claude SkyrimNet Proxy
-cd /d "E:\Tools\claude-skyrimnet-proxy"
-python proxy.py
+cd /d "%~dp0"
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" proxy.py
+) else (
+  py -3 proxy.py
+)
 pause

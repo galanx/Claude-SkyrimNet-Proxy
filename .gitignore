@@ -8,3 +8,7 @@ capture_*.py
 *.log
 .venv/
 venv/
+config.json
+*.protected
+!tests/test_chatgpt.py
+!tests/test_claude_stream_logging.py

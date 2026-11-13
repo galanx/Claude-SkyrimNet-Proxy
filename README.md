@@ -1,5 +1,25 @@
 # Claude SkyrimNet Proxy
 
+## ChatGPT subscription support
+
+This local adaptation adds OpenAI's public Sign in with ChatGPT flow alongside Claude and OpenRouter.
+
+1. Install Python 3.10 or newer and run `python -m pip install -r requirements.txt`.
+2. Start `start-proxy.bat`, or run `python proxy.py`.
+3. Open `http://127.0.0.1:8000/chatgpt`, then choose **Continue with ChatGPT** and authorize ChatGPT plan usage.
+4. Pick an available model and use **Test streaming reply**. This reports first-text and total reply time.
+5. Copy its `chatgpt/MODEL` ID into SkyrimNet, with endpoint `http://127.0.0.1:8000/v1/chat/completions` and an empty API key.
+
+GPT-6.1 Terra is the initial dialogue choice when it appears in the account's catalog. Model access and plan usage eligibility are verified by a completed live request. Reasoning is set to `none`, so choose a model that supports it. The proxy forwards SkyrimNet's character instructions, conversation history and in-text action tags directly. No agent harness or model tools are added. It uses the public Responses API and translates streamed text into the Chat Completions format SkyrimNet expects.
+
+OpenRouter keeps `provider/model` IDs. Comma-separated IDs rotate per request, including lists mixing ChatGPT, Claude and OpenRouter. Routing follows the requested IDs. OpenRouter requests also set reasoning to `none` and exclude reasoning text. Select models that permit reasoning to be disabled. The proxy does not select providers based on dialogue content.
+
+ChatGPT accounts can be added, selected and reauthorized from the setup page. Pausing ChatGPT clears the active selection and retains saved registrations. Credentials and saved OpenRouter settings are encrypted with Windows DPAPI on Windows. Unix files use owner-only permissions. Keep `*.protected` files private. These local files are excluded from source packages. Claude CLI is optional for the other providers. The original Claude route still uses the project's existing authentication method.
+
+Offline checks run with `python -m unittest discover -s tests -v`. Live subscription sign-in, account eligibility, actual NPC response timing and saved-game integration require testing on the intended account.
+
+Official protocol references are [registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) and [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+
 An OpenAI-compatible API proxy that routes requests through a Claude Max subscription via the Claude CLI. Designed for use with [SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin) to power AI-driven NPC conversations in Skyrim.
 
 ## How It Works

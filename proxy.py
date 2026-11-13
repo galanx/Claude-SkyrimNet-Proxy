@@ -2,7 +2,7 @@
 OpenAI-compatible proxy using Claude Max subscription.
 
 Architecture:
-  Startup: spawns ONE claude --print from clean temp dir → captures auth headers + minimal body template
+  Startup: spawns ONE claude --print from clean temp dir Ã¢â€ â€™ captures auth headers + minimal body template
   Per-request: direct aiohttp call to api.anthropic.com via persistent session
 
 Optimizations:
@@ -23,8 +23,12 @@ import logging
 import shutil
 import os
 import copy
+import codecs
+import re
+from stream_guard import guard_sse
 import tempfile
 from contextlib import asynccontextmanager, suppress
+from itertools import count
 from typing import Optional
 
 import uvicorn
@@ -34,24 +38,48 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from aiohttp import web
 import aiohttp
+from chatgpt_provider import ChatGPTProvider, complete as complete_chatgpt, protect
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+if __name__ == "__main__":
+    # Mirror the console to logs/proxy.log so failures can be read after the fact.
+    # Only metadata is logged here: never prompts, replies, keys or auth headers.
+    _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _file_handler = RotatingFileHandler(os.path.join(_log_dir, "proxy.log"),
+                                        maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(_file_handler)
 logger = logging.getLogger("proxy")
 
-DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+DEFAULT_MODEL = "claude-sonnet-4-6"
+INTIMATE_SCENE_FALLBACKS = ("deepseek/deepseek-v3.2", "google/gemma-4-31b-it")
+_intimate_scene_counter = count()
+OPENROUTER_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*(?::[a-z0-9][a-z0-9._-]*)?")
+CLAUDE_OR_GPT_MODEL = re.compile(r"(?:^|[._-])(?:claude|chatgpt|gpt)(?=$|[^a-z])")
+CLAUDE_OR_GPT_PROVIDERS = {"anthropic", "openai", "chatgpt", "azure", "azure-openai"}
+# Emitted by the OStimNet active-scene template branches, never by encounter ledgers.
+ACTIVE_SCENE_TAG = "[[isekai-route:ostim-active-v1]]"
+ACTIVE_SCENE_TAG_LINE = re.compile(rf"^[ \t]*{re.escape(ACTIVE_SCENE_TAG)}[ \t]*(?:\r?\n|$)", re.MULTILINE)
 INTERCEPTOR_PORT = 9999
 
 CLAUDE_PATH = shutil.which("claude")
-if not CLAUDE_PATH:
-    raise RuntimeError("claude CLI not found on PATH")
 logger.info(f"Using Claude CLI: {CLAUDE_PATH}")
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+PROTECTED_CONFIG_FILE = CONFIG_FILE + ".protected"
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
+chatgpt = ChatGPTProvider(os.path.join(os.path.dirname(CONFIG_FILE), "chatgpt-accounts.protected"))
 
 
 def _load_config() -> dict:
     """Load persisted config from disk, return empty dict on missing/corrupt file."""
     try:
+        if os.path.exists(PROTECTED_CONFIG_FILE):
+            with open(PROTECTED_CONFIG_FILE, "rb") as f:
+                return json.loads(protect(f.read(), decrypt=True))
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
@@ -60,8 +88,17 @@ def _load_config() -> dict:
 
 def _save_config(data: dict) -> None:
     """Persist config dict to disk."""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    descriptor, temporary = tempfile.mkstemp(dir=os.path.dirname(CONFIG_FILE))
+    try:
+        with os.fdopen(descriptor, "wb") as f:
+            f.write(protect(json.dumps(data).encode()))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, PROTECTED_CONFIG_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # --- Auth cache + persistent session (with single-flight refresh) ---
@@ -120,8 +157,8 @@ auth = AuthCache()
 
 # --- OpenRouter + Round-Robin state ---
 _cfg = _load_config()
-GLOBAL_OPENROUTER_API_KEY: Optional[str] = _cfg.get("openrouter_api_key") or None
-if GLOBAL_OPENROUTER_API_KEY:
+openrouter_api_key: Optional[str] = _cfg.get("openrouter_api_key") or None
+if openrouter_api_key:
     logger.info("OpenRouter API key loaded from config.json")
 _round_robin_counter: int = 0
 
@@ -142,6 +179,28 @@ def pick_model_round_robin(models: list[str]) -> str:
 def is_openrouter_model(model: str) -> bool:
     """OpenRouter models use 'provider/model' format (contain '/')."""
     return "/" in model
+
+
+def pick_scene_model(models: list[str], requested_fallbacks: object) -> str:
+    if isinstance(requested_fallbacks, list):
+        models = models + [item.strip() for item in requested_fallbacks if isinstance(item, str)]
+    preferred = []
+    last_resort = []
+    for model in dict.fromkeys(models):
+        model_id = model.casefold()
+        if model_id.startswith("claude-") and "/" not in model_id:
+            last_resort.append(model)
+        elif OPENROUTER_MODEL_ID.fullmatch(model_id):
+            provider, name = model_id.split("/", 1)
+            if provider == "openrouter" or name.partition(":")[0] in {"auto", "router"}:
+                continue
+            if provider in CLAUDE_OR_GPT_PROVIDERS or CLAUDE_OR_GPT_MODEL.search(name):
+                last_resort.append(model)
+            else:
+                preferred.append(model)
+
+    eligible = preferred or last_resort or INTIMATE_SCENE_FALLBACKS
+    return eligible[next(_intimate_scene_counter) % len(eligible)] if len(eligible) > 1 else eligible[0]
 
 
 # --- MITM Interceptor (startup only) ---
@@ -188,7 +247,6 @@ async def interceptor_handler(request):
 
         template_size = len(json.dumps(captured_template))
         logger.info(f"Captured {len(auth.headers)} headers + template ({template_size:,} bytes, tools stripped)")
-        logger.info(f"New Auth code: {auth.headers.get('Authorization', 'Error - No Auth Found')}")
 
     # Forward to real API
     async with aiohttp.ClientSession() as session:
@@ -226,8 +284,9 @@ async def capture_auth():
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        except asyncio.TimeoutError:
-            proc.kill()
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if proc.returncode is None:
+                proc.kill()
             with suppress(Exception):
                 await proc.wait()
             raise
@@ -263,7 +322,7 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
     billing = body["system"][0]
     body["system"] = [billing]
     if system_prompt:
-        body["system"].append({"type": "text", "text": system_prompt})
+        body["system"].extend(claude_text_blocks(system_prompt))
 
     # 2. Build full conversation, preserving template auth blocks in first user msg
     auth_blocks = []
@@ -277,11 +336,25 @@ def _build_api_body(system_prompt: Optional[str], messages: list, model: str) ->
     new_messages = []
     for i, m in enumerate(messages):
         if i == 0 and m["role"] == "user":
-            content = auth_blocks + [{"type": "text", "text": m["content"]}]
+            content = auth_blocks + claude_text_blocks(m["content"])
             new_messages.append({"role": "user", "content": content})
         else:
-            new_messages.append({"role": m["role"], "content": [{"type": "text", "text": m["content"]}]})
+            new_messages.append({"role": m["role"], "content": claude_text_blocks(m["content"])})
     body["messages"] = new_messages
+
+    # Keep the earliest cache breakpoints and leave all prompt text intact.
+    # Automatic caching also consumes one of Anthropic's four slots.
+    remaining_cache_slots = 4 - int("cache_control" in body)
+    cache_blocks = body.get("tools", []) + body["system"]
+    for message in new_messages:
+        cache_blocks.extend(message["content"])
+    for block in cache_blocks:
+        if "cache_control" not in block:
+            continue
+        if remaining_cache_slots:
+            remaining_cache_slots -= 1
+        else:
+            del block["cache_control"]
 
     # 3. Model, streaming, and disable extended thinking
     body["model"] = model
@@ -427,35 +500,70 @@ async def call_api_streaming_with_retry(system_prompt: Optional[str], messages: 
                 yield f"data: {json.dumps(role_chunk)}\n\n"
 
                 buffer = ""
-                async for raw_chunk in resp.content.iter_any():
-                    buffer += raw_chunk.decode("utf-8", errors="replace")
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:].strip()
-                        if not data_str or data_str == "[DONE]":
-                            continue
-                        try:
-                            event = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
+                upstream_completed = False
+                # Diagnostics for replies that arrive without text (SkyrimNet: "Empty completion").
+                anthropic_id = resp.headers.get("request-id", "?")
+                stop_reason = None
+                stream_error = None
+                block_types = []
+                last_event = None
+                try:
+                    async for raw_chunk in resp.content.iter_any():
+                        buffer += raw_chunk.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                        if event.get("type") == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = delta.get("text", "")
-                                if text:
-                                    total_chars += len(text)
-                                    oai_chunk = {
-                                        "id": cmpl_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-                                    }
-                                    yield f"data: {json.dumps(oai_chunk)}\n\n"
+                            event_type = event.get("type")
+                            last_event = event_type
+                            if event_type == "message_stop":
+                                upstream_completed = True
+                            elif event_type == "message_delta":
+                                stop_reason = event.get("delta", {}).get("stop_reason") or stop_reason
+                            elif event_type == "content_block_start":
+                                block_types.append(event.get("content_block", {}).get("type"))
+                            elif event_type == "error":
+                                error = event.get("error", {})
+                                stream_error = f"{error.get('type')}: {str(error.get('message'))[:200]}"
+                                logger.warning(f"[{request_id}] Claude stream error from Anthropic "
+                                               f"(request-id {anthropic_id}): {stream_error}")
+                            if event_type == "content_block_delta":
+                                delta = event.get("delta", {})
+                                if delta.get("type") == "text_delta":
+                                    text = delta.get("text", "")
+                                    if text:
+                                        total_chars += len(text)
+                                        oai_chunk = {
+                                            "id": cmpl_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                                        }
+                                        yield f"data: {json.dumps(oai_chunk)}\n\n"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                    logger.warning(f"[{request_id}] Claude stream connection failed after {time.time() - start:.1f}s "
+                                   f"({total_chars} chars, request-id {anthropic_id}): {type(error).__name__}: {error}")
+                    raise
+
+                elapsed = time.time() - start
+                if not upstream_completed:
+                    logger.warning(f"[{request_id}] Claude stream ended before message_stop after {elapsed:.1f}s "
+                                   f"({total_chars} chars, last event {last_event}, error {stream_error or 'none'}, "
+                                   f"request-id {anthropic_id})")
+                    raise RuntimeError("Claude stream ended before message_stop")
+                if not total_chars:
+                    logger.warning(f"[{request_id}] Claude replied with no text after {elapsed:.1f}s "
+                                   f"(stop_reason {stop_reason}, blocks {block_types}, request-id {anthropic_id})")
 
                 stop_chunk = {
                     "id": cmpl_id,
@@ -467,8 +575,7 @@ async def call_api_streaming_with_retry(system_prompt: Optional[str], messages: 
                 yield f"data: {json.dumps(stop_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
-                elapsed = time.time() - start
-                logger.info(f"[{request_id}] <- {total_chars} chars ({elapsed:.1f}s, streamed)")
+                logger.info(f"[{request_id}] <- {total_chars} chars ({elapsed:.1f}s, streamed, stop {stop_reason})")
                 return
         finally:
             if owns_session:
@@ -496,10 +603,13 @@ async def call_openrouter_direct(openrouter_api_key: str, system_prompt: Optiona
     if system_prompt:
         oai_messages.append({"role": "system", "content": system_prompt})
     for m in messages:
-        oai_messages.append({"role": m["role"], "content": m["content"]})
+        oai_messages.append(copy.deepcopy(m))
 
     payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens}
     payload.update({k: v for k, v in extra_params.items() if v is not None})
+    for field in ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call", "reasoning_effort"):
+        payload.pop(field, None)
+    payload["reasoning"] = {"effort": "none", "exclude": True}
     headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -535,10 +645,13 @@ async def call_openrouter_streaming(openrouter_api_key: str, system_prompt: Opti
     if system_prompt:
         oai_messages.append({"role": "system", "content": system_prompt})
     for m in messages:
-        oai_messages.append({"role": m["role"], "content": m["content"]})
+        oai_messages.append(copy.deepcopy(m))
 
     payload = {"model": model, "messages": oai_messages, "max_tokens": max_tokens, "stream": True}
     payload.update({k: v for k, v in extra_params.items() if v is not None})
+    for field in ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call", "reasoning_effort"):
+        payload.pop(field, None)
+    payload["reasoning"] = {"effort": "none", "exclude": True}
     headers = {"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"}
 
     request_id = uuid.uuid4().hex[:8]
@@ -556,21 +669,14 @@ async def call_openrouter_streaming(openrouter_api_key: str, system_prompt: Opti
             if resp.status != 200:
                 error_body = await resp.text()
                 logger.error(f"[{request_id}] OpenRouter {resp.status}: {error_body[:300]}")
-                cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-                err_chunk = {
-                    "id": cmpl_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": f"[OpenRouter Error {resp.status}]"}, "finish_reason": None}],
-                }
+                err_chunk = {"error": {"message": f"OpenRouter request failed ({resp.status})", "type": "upstream_error"}}
                 yield f"data: {json.dumps(err_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
                 return
 
             buffer = ""
+            decoder = codecs.getincrementaldecoder("utf-8")()
             async for raw_chunk in resp.content.iter_any():
-                buffer += raw_chunk.decode("utf-8", errors="replace")
+                buffer += decoder.decode(raw_chunk)
                 while "\n\n" in buffer:
                     event, buffer = buffer.split("\n\n", 1)
                     event = event.strip()
@@ -591,7 +697,8 @@ async def call_openrouter_streaming(openrouter_api_key: str, system_prompt: Opti
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[dict]
+    model_config = ConfigDict(extra="allow")
 
 
 class ChatRequest(BaseModel):
@@ -603,125 +710,78 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+def consume_active_scene_tag(messages: list[ChatMessage]) -> bool:
+    active = False
+    for message in messages:
+        if message.role not in ("system", "developer", "user"):
+            continue
+        if isinstance(message.content, str):
+            if ACTIVE_SCENE_TAG in message.content:
+                message.content, removed = ACTIVE_SCENE_TAG_LINE.subn("", message.content)
+                active |= bool(removed)
+            continue
+        for block in message.content:
+            text = block.get("text")
+            if block.get("type") == "text" and isinstance(text, str) and ACTIVE_SCENE_TAG in text:
+                block["text"], removed = ACTIVE_SCENE_TAG_LINE.subn("", text)
+                active |= bool(removed)
+    return active
+
+
 @asynccontextmanager
 async def lifespan(app):
-    runner = await start_interceptor()
+    runner = await start_interceptor() if CLAUDE_PATH else None
 
     # Persistent outgoing HTTP session
     auth.session = aiohttp.ClientSession()
 
-    # Capture auth at startup (single-flight safe)
-    await auth.ensure_ready(force=True, timeout=60)
+    async def warm_claude():
+        try:
+            await auth.ensure_ready(force=True, timeout=60)
+        except Exception:
+            logger.warning("Claude sign-in unavailable. ChatGPT and OpenRouter remain available.")
+
+    warm_task = asyncio.create_task(warm_claude()) if CLAUDE_PATH else None
 
     try:
         yield
     finally:
+        if warm_task:
+            warm_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warm_task
         if auth.session:
             await auth.session.close()
             auth.session = None
-        await runner.cleanup()
+        if runner:
+            await runner.cleanup()
 
 
 app = FastAPI(title="Claude SkyrimNet Proxy", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, request: Request):
-    # Parse model list and pick via round-robin
-    model_field = req.model or DEFAULT_MODEL
-    models = parse_model_list(model_field)
-    model = pick_model_round_robin(models) if len(models) > 1 else models[0]
-    use_openrouter = is_openrouter_model(model)
+def claude_text_blocks(content):
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if any(block.get("type") != "text" or not isinstance(block.get("text"), str) for block in content):
+        raise HTTPException(400, "The Claude route currently supports text blocks only")
+    return copy.deepcopy(content)
 
-    system_prompt = None
-    anthropic_messages = []
-    for msg in req.messages:
-        if msg.role == "system":
-            system_prompt = msg.content
-        elif msg.role in ("user", "assistant"):
-            anthropic_messages.append({"role": msg.role, "content": msg.content})
 
-    if not anthropic_messages:
-        raise HTTPException(status_code=400, detail="No user message provided")
-
-    if anthropic_messages[0]["role"] != "user":
-        anthropic_messages.insert(0, {"role": "user", "content": "Continue."})
-
-    # Merge consecutive same-role messages
-    merged = []
-    for msg in anthropic_messages:
-        if merged and merged[-1]["role"] == msg["role"]:
-            merged[-1]["content"] += "\n\n" + msg["content"]
-        else:
-            merged.append(msg)
-
-    max_tokens = req.max_tokens or 4096
-    extra_params = {k: v for k, v in (req.model_extra or {}).items() if v is not None}
-
-    # Route to correct provider
-    if use_openrouter:
-        try:
-            #Get the API key if it's stored in the webUI, else look at the headers from SkyrimNet to see if it's there. If it's not,
-            open_router_api_key = GLOBAL_OPENROUTER_API_KEY if GLOBAL_OPENROUTER_API_KEY else request.headers.get("authorization").removeprefix("Bearer ").strip()
-        except AttributeError:
-            raise HTTPException(status_code=401, detail="OpenRouter API key not configured, upload it to the WebUI or place it in the Skyrimnet API Settings")
-        
-        if req.stream:
-            return StreamingResponse(
-                call_openrouter_streaming(open_router_api_key, system_prompt, merged, model, max_tokens, **extra_params),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-        response = await call_openrouter_direct(open_router_api_key, system_prompt, merged, model, max_tokens, **extra_params)
-    else:
-        # Ensure auth is available (queues behind refresh if one is in progress)
-        try:
-            await auth.ensure_ready(timeout=60)
-        except Exception:
-            raise HTTPException(status_code=503, detail="Auth not ready -- warming up")
-
-        if req.stream:
-            # Streaming must handle retry inside the generator (can't be caught outside)
-            return StreamingResponse(
-                call_api_streaming_with_retry(system_prompt, merged, model, max_tokens),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-
-        # Non-stream: retry once after a forced refresh on 401/403
-        response = None
-        for attempt in range(2):
-            try:
-                response = await call_api_direct(system_prompt, merged, model, max_tokens)
-                break
-            except HTTPException as e:
-                if e.status_code in (401, 403) and attempt == 0:
-                    logger.warning("Auth invalid -> forcing refresh once and retrying request")
-                    auth.invalidate()
-                    await auth.ensure_ready(force=True, timeout=60)
-                    continue
-                raise
-
-    if not response:
-        raise HTTPException(status_code=500, detail="Empty response")
-
-    prompt_text = (system_prompt or "") + " ".join(m["content"] for m in merged)
-    prompt_tokens = len(prompt_text) // 4
-    completion_tokens = len(response) // 4
-
+def completion_result(text, model, prompt):
+    prompt_tokens = len(prompt) // 4
+    completion_tokens = len(text) // 4
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": response, "name": None},
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text, "name": None},
+            "finish_reason": "stop",
+        }],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -731,8 +791,100 @@ async def chat_completions(req: ChatRequest, request: Request):
     }
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatRequest, request: Request):
+    if not any(message.role == "user" for message in req.messages):
+        raise HTTPException(400, "No user message provided")
+    models = parse_model_list(req.model or DEFAULT_MODEL)
+    intimate_scene = consume_active_scene_tag(req.messages)
+    if intimate_scene:
+        model = pick_scene_model(models, (req.model_extra or {}).get("models"))
+        logger.info("OStimNet scene route -> %s", model)
+    else:
+        if not models:
+            raise HTTPException(400, "A model is required")
+        model = pick_model_round_robin(models) if len(models) > 1 else models[0]
+    if model == "claude-sonnet-4-5-20250929":
+        logger.info("Mapping legacy Sonnet 4.5 request to %s", DEFAULT_MODEL)
+        model = DEFAULT_MODEL
+    if model.startswith("chatgpt/"):
+        try:
+            return await complete_chatgpt(chatgpt, auth.session, req, model)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            raise HTTPException(502, "ChatGPT connection interrupted")
+
+    max_tokens = req.max_tokens or 4096
+    stream_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if is_openrouter_model(model):
+        key = openrouter_api_key or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        if not key:
+            raise HTTPException(401, "Configure your OpenRouter API key in the dashboard")
+        messages = [message.model_dump(exclude_none=True) for message in req.messages]
+        extra_params = {key: value for key, value in (req.model_extra or {}).items() if value is not None}
+        if intimate_scene:
+            # Keep OpenRouter on the pinned model even if the caller supplies routing options.
+            for field in ("models", "route", "preset", "plugins"):
+                extra_params.pop(field, None)
+        if req.temperature is not None:
+            extra_params["temperature"] = req.temperature
+        if req.stream:
+            return StreamingResponse(
+                guard_sse(call_openrouter_streaming(key, None, messages, model, max_tokens, **extra_params)),
+                media_type="text/event-stream", headers=stream_headers,
+            )
+        try:
+            text = await call_openrouter_direct(key, None, messages, model, max_tokens, **extra_params)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            logger.warning("OpenRouter request interrupted (%s)", type(error).__name__)
+            raise HTTPException(502, "OpenRouter connection interrupted; retry the request") from None
+        return completion_result(text, model, json.dumps(messages, ensure_ascii=False))
+
+    if not CLAUDE_PATH:
+        raise HTTPException(503, "Claude CLI is not installed. Select a ChatGPT or OpenRouter model.")
+    system_blocks = []
+    messages = []
+    for message in req.messages:
+        blocks = claude_text_blocks(message.content)
+        if message.role in ("system", "developer"):
+            system_blocks.extend(blocks)
+        elif message.role in ("user", "assistant"):
+            messages.append({"role": message.role, "content": blocks})
+        else:
+            raise HTTPException(400, "Unsupported message role for Claude")
+    if messages[0]["role"] != "user":
+        messages.insert(0, {"role": "user", "content": [{"type": "text", "text": "Continue."}]})
+    merged = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1]["content"].extend(message["content"])
+        else:
+            merged.append(message)
+    try:
+        await auth.ensure_ready(timeout=60)
+    except Exception:
+        raise HTTPException(503, "Claude authentication is not ready")
+    if req.stream:
+        return StreamingResponse(
+            guard_sse(call_api_streaming_with_retry(system_blocks, merged, model, max_tokens)),
+            media_type="text/event-stream", headers=stream_headers,
+        )
+    text = None
+    for attempt in range(2):
+        try:
+            text = await call_api_direct(system_blocks, merged, model, max_tokens)
+            break
+        except HTTPException as error:
+            if error.status_code not in (401, 403) or attempt:
+                raise
+            auth.invalidate()
+            await auth.ensure_ready(force=True, timeout=60)
+    if not text:
+        raise HTTPException(500, "Empty response")
+    return completion_result(text, model, json.dumps(req.model_dump()["messages"], ensure_ascii=False))
+
 @app.post("/config/openrouter-key")
 async def set_openrouter_key(request: Request):
+    require_local_setup(request)
     global openrouter_api_key
     data = await request.json()
     key = data.get("key", "").strip()
@@ -754,27 +906,90 @@ async def set_openrouter_key(request: Request):
 async def list_models():
     data = [
         {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic"},
-        {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
+        {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic"},
         {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
     ]
     if openrouter_api_key:
         data.append({"id": "openrouter/*", "object": "model", "owned_by": "openrouter"})
+    if chatgpt.state["active"]:
+        try:
+            data.extend(await chatgpt.models(auth.session))
+        except (HTTPException, aiohttp.ClientError, asyncio.TimeoutError):
+            logger.warning("ChatGPT model list unavailable. Reconnect from the dashboard.")
     return {"object": "list", "data": data}
 
 
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy" if auth.is_ready else "warming_up",
+        "status": "healthy" if auth.is_ready or openrouter_api_key or chatgpt.state["active"] else "needs_sign_in",
         "claude_path": CLAUDE_PATH,
         "auth_cached": auth.is_ready,
         "openrouter_configured": openrouter_api_key is not None,
+        "chatgpt": chatgpt.status(),
     }
+
+
+def require_local_setup(request):
+    origin = request.headers.get("origin")
+    allowed = {f"http://127.0.0.1:{PROXY_PORT}", f"http://localhost:{PROXY_PORT}"}
+    if request.headers.get("x-proxy-setup") != "1" or (origin and origin not in allowed):
+        raise HTTPException(403, "Open setup from the local proxy dashboard")
+
+
+@app.post("/chatgpt/sign-in")
+async def chatgpt_sign_in(request: Request):
+    require_local_setup(request)
+    body = await request.json()
+    url = await chatgpt.authorize(f"http://127.0.0.1:{PROXY_PORT}/auth/callback", body.get("account_id"))
+    return {"url": url}
+
+
+@app.get("/auth/callback", response_class=HTMLResponse)
+async def chatgpt_callback(request: Request):
+    try:
+        enabled, first = await chatgpt.callback(auth.session, request.query_params)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise HTTPException(502, "Sign-in connection interrupted. Start again.")
+    if not enabled:
+        return HTMLResponse('<h1>ChatGPT plan usage is disabled</h1><p>Sign in again and enable plan usage to send NPC requests.</p><a href="/chatgpt">Back to setup</a>', headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+    if first:
+        return HTMLResponse('<dialog open><h1>YouÃ¢â‚¬â„¢re using your ChatGPT plan</h1><p>Eligible NPC requests in this proxy use your ChatGPT plan. Manage usage in ChatGPT settings.</p><a href="/chatgpt">Got it</a></dialog>', headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+    return HTMLResponse('<p>ChatGPT connected.</p><a href="/chatgpt">Continue</a>', headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@app.get("/chatgpt/status")
+async def chatgpt_status():
+    return chatgpt.status()
+
+
+@app.post("/chatgpt/select")
+async def chatgpt_select(request: Request):
+    require_local_setup(request)
+    await chatgpt.select((await request.json()).get("account_id"))
+    return chatgpt.status()
+
+
+@app.get("/chatgpt/models")
+async def chatgpt_models():
+    try:
+        return {"data": await chatgpt.models(auth.session)}
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise HTTPException(502, "Could not reach the ChatGPT model catalog")
+
+
+@app.get("/chatgpt", response_class=HTMLResponse)
+async def chatgpt_setup():
+    return HTMLResponse(CHATGPT_PAGE, headers={"Cache-Control": "no-store"})
+
+
+with open(os.path.join(os.path.dirname(__file__), "chatgpt.html"), encoding="utf-8") as page:
+    CHATGPT_PAGE = page.read()
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    status = "Ready" if auth.is_ready else "Warming up..."
+    status = "Ready" if auth.is_ready else "Claude not connected"
     status_color = "#4ade80" if auth.is_ready else "#facc15"
     template_size = len(json.dumps(auth.body_template)) if auth.body_template else 0
 
@@ -783,7 +998,7 @@ async def dashboard():
 
     models = [
         ("claude-opus-4-6", "Opus 4.6", "Most capable, slowest"),
-        ("claude-sonnet-4-5-20250929", "Sonnet 4.5", "Best balance (default)"),
+        ("claude-sonnet-4-6", "Sonnet 4.6", "Best balance (default)"),
         ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest, least capable"),
         ("provider/model", "OpenRouter", "Any model via OpenRouter (requires key)"),
     ]
@@ -817,7 +1032,8 @@ async def dashboard():
 </style></head>
 <body>
   <h1>Claude SkyrimNet Proxy</h1>
-  <div class="subtitle">OpenAI-compatible proxy using Claude Max subscription</div>
+  <div class="subtitle">Claude, ChatGPT subscriptions and OpenRouter for SkyrimNet</div>
+  <p><a href="/chatgpt" style="color:#93c5fd">ChatGPT account, models and streaming test</a></p>
   <span class="status">{status}</span>
 
   <div class="card">
@@ -828,7 +1044,7 @@ async def dashboard():
     <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-top:12px">
       <div><span class="label">Template</span><br><span class="value">{template_size:,} bytes</span></div>
       <div><span class="label">Default Model</span><br><span class="value">{DEFAULT_MODEL.split("-")[1].title()} {DEFAULT_MODEL.split("-")[2]}</span></div>
-      <div><span class="label">Claude CLI</span><br><span class="value">{os.path.basename(CLAUDE_PATH)}</span></div>
+      <div><span class="label">Claude CLI</span><br><span class="value">{os.path.basename(CLAUDE_PATH) if CLAUDE_PATH else 'Not installed'}</span></div>
     </div>
   </div>
 
@@ -868,7 +1084,7 @@ async function saveOrKey() {{
   const status = document.getElementById('orStatus');
   try {{
     await fetch('/config/openrouter-key', {{
-      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      method: 'POST', headers: {{'Content-Type': 'application/json', 'X-Proxy-Setup': '1'}},
       body: JSON.stringify({{key: key}})
     }});
     status.textContent = key ? 'Configured (saved)' : 'Not set';
@@ -892,7 +1108,7 @@ async function testChat() {{
     const r = await fetch('/v1/chat/completions', {{
       method: 'POST', headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{
-        model: 'claude-sonnet-4-5-20250929',
+        model: 'claude-sonnet-4-6',
         messages: [
           {{role: 'system', content: document.getElementById('sysPrompt').value}},
           {{role: 'user', content: document.getElementById('userMsg').value}}
@@ -917,4 +1133,5 @@ async function testChat() {{
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # OAuth codes arrive in the callback URL, so suppress URL access logging.
+    uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, access_log=False)
